@@ -1052,25 +1052,10 @@ export async function initializeViewerMain(options: ViewerMainOptions): Promise<
     console.error('Failed to load theme at init, using defaults:', error);
   }
 
-  // Remove the preload style that hides the page content
-  // This should be done after the toolbar is generated but before rendering
-  const preloadStyle = document.getElementById('markdown-viewer-preload');
-  if (preloadStyle) {
-    preloadStyle.remove();
-  }
-
-  // Make body visible with a smooth fade-in
-  document.body.style.opacity = '1';
-  document.body.style.overflow = 'hidden';
-  document.body.style.transition = 'none';
-
-  // Notify the parent (workspace page) that the viewer is themed and visible,
-  // so it can reveal the iframe. Harmless when this page is not embedded.
-  try {
-    if (window.parent !== window) {
-      window.parent.postMessage({ type: 'VIEWER_RENDERED' }, '*');
-    }
-  } catch { /* cross-origin parent \u2014 ignore */ }
+  // NOTE: Unveil is intentionally deferred until after the initial render
+  // completes and scroll position is restored (see runInitialRender below).
+  // Unveiling here would show an empty toolbar shell for ~70ms, then a
+  // 15000px+ scroll jump when scroll restoration fires (issue #110).
 
   // Wait for two paint frames, then start processing.
   // This avoids a fixed delay while still letting initial DOM/CSS settle.
@@ -1078,6 +1063,27 @@ export async function initializeViewerMain(options: ViewerMainOptions): Promise<
     return new Promise((resolve) => {
       requestAnimationFrame(() => resolve());
     });
+  };
+
+  // Reveal the page after content is rendered and scroll is restored.
+  // Extracted as a function so it can be called from a try/finally to guarantee
+  // the page never gets stuck dark if rendering throws.
+  const unveilPage = (): void => {
+    const preloadStyle = document.getElementById('markdown-viewer-preload');
+    if (preloadStyle) {
+      preloadStyle.remove();
+    }
+    document.body.style.opacity = '1';
+    document.body.style.overflow = 'hidden';
+    document.body.style.transition = 'none';
+
+    // Notify the parent (workspace page) that the viewer is themed and visible,
+    // so it can reveal the iframe. Harmless when this page is not embedded.
+    try {
+      if (window.parent !== window) {
+        window.parent.postMessage({ type: 'VIEWER_RENDERED' }, '*');
+      }
+    } catch { /* cross-origin parent — ignore */ }
   };
 
   const runInitialRender = async (): Promise<void> => {
@@ -1100,7 +1106,62 @@ export async function initializeViewerMain(options: ViewerMainOptions): Promise<
 
     toolbarManager.initializeToolbar();
 
-    await renderMarkdown(liveRawContent, savedScrollLine, pendingAnchor ?? undefined);
+    // Unveil strategy (issue #110):
+    // Wait for the page to be in a presentable state, but do NOT wait for async
+    // diagrams (mermaid/vega/drawio) — they can render after unveil.
+    // - With saved scroll position: unveil when scrollTop first becomes non-zero
+    //   (scroll restored to target line). This happens during streaming render.
+    // - Without saved scroll: unveil when the first content block appears.
+    // In both cases, this fires well before async diagrams complete.
+    let unveiled = false;
+    const unveilOnce = (): void => {
+      if (unveiled) return;
+      unveiled = true;
+      unveilPage();
+    };
+
+    const hasScrollTarget = savedScrollLine !== undefined && savedScrollLine > 0;
+    const unveilSignal = new Promise<void>((resolve) => {
+      let frames = 0;
+      const maxFrames = 90; // ~1.5s fallback
+      const check = (): void => {
+        if (unveiled || frames >= maxFrames) {
+          resolve();
+          return;
+        }
+        if (hasScrollTarget) {
+          const wrapper = document.getElementById('markdown-wrapper');
+          if (wrapper && wrapper.scrollTop > 0) {
+            resolve();
+            return;
+          }
+        } else {
+          const content = document.getElementById('markdown-content');
+          if (content && content.children.length > 0) {
+            resolve();
+            return;
+          }
+        }
+        frames++;
+        requestAnimationFrame(check);
+      };
+      requestAnimationFrame(check);
+    });
+
+    try {
+      const renderPromise = renderMarkdown(liveRawContent, savedScrollLine, pendingAnchor ?? undefined);
+
+      // Unveil when the page is presentable (scroll restored or first content).
+      // renderPromise continues running in the background (async diagrams).
+      await unveilSignal;
+      await waitForNextFrame(); // Let the restored scroll / first paint settle.
+      unveilOnce();
+
+      // Wait for render to fully complete before post-render setup.
+      await renderPromise;
+    } finally {
+      unveilOnce();
+    }
 
     await saveToHistory(platform);
     setupTocToggle();
